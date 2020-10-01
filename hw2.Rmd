@@ -1,0 +1,232 @@
+---
+title: "HW2"
+author: "YUKUN FANG yfang67@wisc"
+output: html_document
+---
+
+```{r 1, include=FALSE}
+rm(list = ls())
+require(FITSio)
+```
+
+## Data Preprocess
+
+### Read .fits files
+
+It is important that I cannot use the $setwd()$ function so I tried $paste()$ and $assign()$. But I find it is time consuming.
+
+```
+cB58 <- readFrameFromFITS("cB58_Lyman_break.fit")
+filename = dir("data/")
+file_load <- c()
+for(i in 1:length(filename)){
+  file_load[i] <- paste("data/",filename[i],sep = "")
+  assign(filename[i], readFrameFromFITS(file_load[i]))
+}
+end = Sys.time()
+```
+
+### Test *and_mask* != 0 and handle them
+
+At the first time, I think dropping the points will make the work more simple but this will break the continuity of the *loglam*. So I change it to linear interpolation.\
+
+My point is to search all spectrum and find the non-zero *and_mask* points. For example the blue lines is the primary spectrum and the red lines are after-preprocess spectrum.\
+
+My point is *and_mask*!=0 point in the beginning or end, I make the flux the nearest flux who has non-zero *and_mask*. If it is within the spectrum, use the linear interpolation.
+
+```{r LinearInterpolation, echo=FALSE}
+y1 <- c(.1,1.9,3,1,4,1,3,2,1.6,5,3.4)
+y2 <- c(1.9,1.9,3,3.5,4,1,1.2,1.4,1.6,1.6,1.6)
+plot(1:length(y1),y1,ylim = c(0,6),xlab = "Index",ylab = "Flux",type ="l" , lty = 2, col= "blue", main = "Example")
+points(x=c(2,3,5,6,9),y=c(1.9,3,4,1,1.6),pch=16,col="blue")
+points(x=c(1,4,7,8,10,11),y=c(.1,1,3,2,5,3.4),pch=4,col="blue")
+points(x=c(1,4,7,8,10,11),y=c(1.9,3.5,1.2,1.4,1.6,1.6),pch = 17,col = "red")
+lines(x=1:length(y2),y=y2,col="red")
+
+legend("topleft",c("and_mask=0","and_mask!=0","interpolation","old","new"),pch = c(16,4,17,16,17),lty=c(0,0,0,2,1),col=c("blue","blue","red","blue","red"),cex=0.8)
+```
+
+If one file has more than half and_mask!=0, I choose not to use linear interpolation and just let it go.  
+
+### Scale the data
+
+I choose the method: subtract their mean and divided by the difference between maximum and minimum. This works well in my algorithm.
+
+
+## Spectrum Alignment Algorithm
+
+### First try: Simple 
+
+I use the simplest method which is just scan all of the spectrum one by one, which is very slow and do something useless. I compare the euclidean distance and the correlation coefficient. I find second one is more reasonable and fast. So this is my first method which also have a good result.
+
+```
+for(d in 1:length(filename)){
+  data=get(filename[d])
+  #plot(data$loglam,data$flux,type='l')
+
+  #If too many and_mask != 0
+  if (sum(data$and_mask != 0) > 0.5* nrow(data)){
+    distance[d]=100
+    next
+  }
+  i = 1
+  j = 1
+  cor_data <- c()
+  for(i in 1:(nrow(data)-nrow(cB58)+1)){
+    cor_data[i]=abs(cor(data$flux[i:(i+nrow(cB58)-1)],cB58$FLUX)-1)
+  }
+  distance[d] = min(cor_data)
+}
+```
+
+<font color=red>Difficulty</font> - It is time consuming and will not be useful for more data sets.
+
+### Second try: Standard(Weighted) Euclidean Distance
+
+But I find this method doesn't use the *ivar* in the algorithm, so I come up with the second method which use the function d to show distance:
+$$d = \frac{1}{n}\sqrt{\sum_{i=1}^{n}\omega_{i}(X_i-Y_i)^2}$$
+which $\omega_i=ivar_i$
+
+```
+distance <- c()
+for(d in 1:length(filename)){
+  data=get(filename[d])
+  #plot(data$loglam,data$flux,type='l')
+  
+  #If too many and_mask != 0
+  if (sum(data$and_mask != 0) > 0.5* nrow(data)){
+    distance[d]=100
+    next
+  }
+  wei_dis_data <- c()
+  i = 1
+  j = 1
+  while(i <= (nrow(data)-nrow(cB58)+1)){
+    s = 0
+    for(j in i:(i+nrow(cB58)-1)){
+      s = s + data$ivar[j]*((data$flux[j]-cB58$FLUX[j-i+1])^2)
+    }
+    wei_dis_data[i%/%10+1]=(1/nrow(cB58))*sqrt(s)
+    i=i+10
+  }
+  distance[d] = min(wei_dis_data)
+}
+```
+
+<font color=red>Difficulty</font> - The calculate value is too big and it will useless when getting larger files and also it is consuming. The *ivar* has a bad use.
+
+
+### Best: Drops Search
+
+Actually, because the two methods before just scan every i which is very time consuming. I think what I need to do is to find the characteristic points which contain the most important information in *cB58*.
+
+```{r algorithm}
+PeakAlgorithm <- function(y,lag,thr) {
+  meanstand <- c()
+  stdstand <- c()
+  return.list = list()
+  ystand <- y[0:lag]
+  peak <- rep(0,length(y))
+  meanstand[lag] <- mean(y[0:lag])
+  stdstand[lag] <- sd(y[0:lag])
+  i = lag + 1
+  while(i <= length(y)){
+    if ( thr*stdstand[i-1] > abs(y[i]-meanstand[i-1])) {
+      peak[i] = 0
+      ystand[i] = y[i]
+    } 
+    else {
+      if (y[i] > log(thr)*meanstand[i-1]) {
+        peak[i] = 0;
+      } else {
+        peak[i] = -1;
+      }
+      ystand[i] = ystand[i-1]
+    }
+    meanstand[i] = mean(ystand[(i-lag):i])
+    stdstand[i] = sd(ystand[(i-lag):i])
+    i=i+1
+  }
+  return.list$peak=peak
+  return.list$meanstand=meanstand
+  return.list$stdstand=stdstand
+  return(return.list)
+}
+lag = 10
+thr = 6
+y <- c(0.9,1,1,1.1,1,0.9,1,1.1,1,1,0.3,2,4,5,2,1,1,1,1,1.1,0.9,1,1.1,1,1,0.9,
+       1,-4,-2,-2.5,1,1.1,1,0.8,0.9,1,1.2,0.9,1,1,1.1,1.2,1,1.5,1,3,4,5,3,2,1,1,1,0.9,1,1,3,
+       4.6,4,3,3.2,2,1,1,0.8,4,4,2,2.5,1,1,1,1,1,1,1,1)
+y=-y
+result <- PeakAlgorithm(y,lag,thr)
+par(mfrow = c(2,1),oma = c(2,2,0,0) + 0.1,mar = c(0,0,2,1) + 0.2)
+plot(1:length(y),y,type="l",ylab="",xlab="")
+lines(1:length(y),result$meanstand,type="l",col="cyan",lwd=2)
+plot(result$peak,type="S",col="red",ylab="",xlab="",ylim=c(-1.5,1.5),lwd=2)
+```
+
+I notice that the *cB58* has characteristic that they have some important drops or troughs. So my algorithm leave out the crest and mark the drops.
+
+Then I analyze the *cB58*:
+```{r cB58}
+cB58 <- readFrameFromFITS("cB58_Lyman_break.fit")
+y = cB58$FLUX-mean(cB58$FLUX)/(max(cB58$FLUX)-min(cB58$FLUX))
+lag       <- 100
+thr       <- 2
+result <- PeakAlgorithm(y,lag,thr)
+par(mfrow = c(2,1),oma = c(2,2,0,0) + 0.1,mar = c(0,0,2,1) + 0.2)
+plot(1:length(y),y,type="l",ylab="",xlab="")
+lines(1:length(y),result$meanstand,type="l",col="cyan",lwd=2)
+lines(1:length(y),result$meanstand+thr*result$stdstand,type="l",col="blue",lwd=2)
+lines(1:length(y),result$meanstand-thr*result$stdstand,type="l",col="green",lwd=2)
+plot(result$peak,type="S",col="red",ylab="",xlab="",ylim=c(-1.5,1.5),lwd=2)
+
+```
+
+Then use these drops to align with the 100 data sets and get top three:
+
+Top:
+
+```{r graph}
+result<-read.csv("hw2.csv")
+fn <- c('first','second','third')
+fileload <- c()
+for(i in 1:3){
+  fileload[i] <- paste("data/",result$spectrum[i],sep = "")
+  assign(fn[i], readFrameFromFITS(fileload[i]))
+}
+ y1=(first$flux-mean(first$flux))/(max(first$flux)-min(first$flux))
+ y2=(cB58$FLUX-mean(cB58$FLUX))/(max(cB58$FLUX)-min(cB58$FLUX) )
+plot(x=1:nrow(first),y=y1,type = "l", main = paste("Gold",result$spectrum[1],sep = ":"), ylim =c(-1,1))
+lines(x=result$i[1]:(result$i[1]+nrow(cB58)-1),y=y2-0.25,col="red")
+
+
+```
+
+Second:
+
+```{r}
+y1=(second$flux-mean(second$flux))/(max(second$flux)-min(second$flux))
+y2=(cB58$FLUX-mean(cB58$FLUX))/(max(cB58$FLUX)-min(cB58$FLUX))
+plot(x=1:nrow(second),y=y1,type = "l", main = paste("Silver",result$spectrum[2],sep = ":"),ylim = c(-1.5,1))
+lines(x=result$i[2]:(result$i[2]+nrow(cB58)-1),y=y2-0.5,col="red")
+```
+
+
+Third:
+
+```{r}
+y1=(third$flux-mean(third$flux))/(max(third$flux)-min(third$flux))
+y2=(cB58$FLUX-mean(cB58$FLUX))/(max(cB58$FLUX)-min(cB58$FLUX))
+plot(x=1:nrow(third),y=y1,type = "l", main = paste("Bronze",result$spectrum[3],sep = ":"))
+lines(x=result$i[3]:(result$i[3]+nrow(cB58)-1),y=y2,col="red")
+
+```
+
+
+<font color=red>Difficulty</font> - The scale is not good which make the shape of graph is different from the beginning. Actually they look same before the scale. Do not know how to use *ivar*.
+
+
+
+
+
